@@ -17,8 +17,8 @@ mod templates;
 // Allowed origins - more permissive for production
 static ALLOWED_ORIGINS: Lazy<[&str; 2]> = Lazy::new(|| [
     "https://6000-firebase-studio-1756614590760.cluster-ubrd2huk7jh6otbgyei4h62ope.cloudworkstations.dev",
-    "http://localhost:3000"
-    "http://localhost:8000"
+    "http://localhost:3000",
+    "http://localhost:8000",
 ]);
 
 // Reqwest client pool
