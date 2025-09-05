@@ -51,13 +51,12 @@ fn validate_url(url: &str) -> Result<String, HttpResponse> {
 // Check if request has valid Origin or Referer - more permissive
 fn get_valid_origin(req: &HttpRequest) -> Option<String> {
     if !*ENABLE_CORS {
-        return Some("*".to_string());
+        return None;
     }
 
-    // Allow all origins in production
     if let Some(origin) = req.headers().get(header::ORIGIN) {
         if let Ok(origin_str) = origin.to_str() {
-            if ALLOWED_ORIGINS.contains(&origin_str) || ALLOWED_ORIGINS.contains(&"*") {
+            if ALLOWED_ORIGINS.contains(&origin_str) {
                 return Some(origin_str.to_string());
             }
         }
@@ -74,8 +73,7 @@ fn get_valid_origin(req: &HttpRequest) -> Option<String> {
         }
     }
 
-    // Default to allowing all origins in production
-    Some("*".to_string())
+    None
 }
 
 fn get_url(line: &str, base: &Url) -> Url {
@@ -97,7 +95,7 @@ fn process_m3u8_line(
     
     let first_char = unsafe { line.as_bytes().get_unchecked(0) };
     
-    if *first_char == b'#' {
+    if (*first_char) == b'#' {
         // Comment line processing
         if line.len() > 11 && line.as_bytes()[10] == b'K' && line.starts_with("#EXT-X-KEY") {
             // #EXT-X-KEY processing
@@ -140,11 +138,10 @@ fn process_m3u8_line(
                 new_q.push_str(h);
             }
             
-            let mut result = String::with_capacity(30 + new_q.len());
-            result.push_str("#EXT-X-MAP:URI=\"/?");
-            result.push_str(&new_q);
-            result.push('"');
-            return result;
+            let mut fixed = String::from("#EXT-X-MAP:URI=\"/?");
+            fixed.push_str(&new_q);
+            fixed.push('"');
+            return fixed;
         }
         
         // Generic URI/URL processing for other tags
@@ -216,7 +213,10 @@ fn process_m3u8_line(
 async fn handle_options(req: HttpRequest) -> impl Responder {
     let origin = match get_valid_origin(&req) {
         Some(o) => o,
-        None => "*".to_string(), // Default to allowing all
+        None => {
+            if *ENABLE_CORS { return HttpResponse::Forbidden().finish(); }
+            "*".to_string()
+        },
     };
 
     HttpResponse::Ok()
@@ -226,17 +226,12 @@ async fn handle_options(req: HttpRequest) -> impl Responder {
         .insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, Expires, Vary, ETag, Last-Modified"))
         .insert_header((header::ACCESS_CONTROL_MAX_AGE, "86400"))
         .insert_header((header::CROSS_ORIGIN_RESOURCE_POLICY, "cross-origin"))
+        .insert_header(("Vary", "Origin"))
         .finish()
 }
 
 #[get("/")]
 async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
-    // Check and extract valid origin - more permissive
-    let origin = match get_valid_origin(&req) {
-        Some(o) => o,
-        None => "*".to_string(), // Default to allowing all
-    };
-
     // Parallel query parsing
     let query_future = task::spawn_blocking({
         let query_string = req.query_string().to_string();
@@ -261,6 +256,13 @@ async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
         Err(_) => return HttpResponse::InternalServerError().body("Query parsing failed"),
     };
 
+    // Determine allowed CORS origin strictly from request headers
+    let acao = get_valid_origin(&req);
+
+    if *ENABLE_CORS && acao.is_none() {
+        return HttpResponse::Forbidden().finish();
+    }
+
     // Get and validate the URL
     let target_url = match query.get("url") {
         Some(u) => match validate_url(u) {
@@ -280,13 +282,13 @@ async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
         let target_url_parsed = target_url_parsed.clone();
         let query = query.clone();
         move || {
-            // Use custom origin if provided, otherwise use template
+            // Use custom origin for upstream request if provided in query (for top-level fetch only)
             let origin_param = query.get("origin").map(|s| s.as_str());
             let mut headers = templates::generate_headers_for_url(&target_url_parsed, origin_param);
 
             // Custom headers support
             if let Some(header_json) = query.get("headers") {
-                if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(header_json) {
+                if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&header_json) {
                     for (k, v) in parsed {
                         if let (Ok(name), Ok(value)) = (
                             HeaderName::from_str(&k),
@@ -297,6 +299,11 @@ async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
                     }
                 }
             }
+
+            // Debug: show chosen origin/referer for upstream
+            let dbg_origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("-");
+            let dbg_referer = headers.get("referer").and_then(|v| v.to_str().ok()).unwrap_or("-");
+            eprintln!("Upstream headers for {} -> origin={}, referer={}", target_url_parsed.as_str(), dbg_origin, dbg_referer);
 
             headers
         }
@@ -338,50 +345,92 @@ async fn m3u8_proxy(req: HttpRequest) -> impl Responder {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let is_m3u8 = target_url.ends_with(".m3u8")
-        || content_type.contains("mpegurl")
+    let ct_is_m3u8 = content_type.contains("mpegurl")
         || content_type.contains("application/vnd.apple.mpegurl")
         || content_type.contains("application/x-mpegurl");
+    let url_looks_m3u8 = target_url.to_ascii_lowercase().ends_with(".m3u8");
 
-    if is_m3u8 {
+    if ct_is_m3u8 || url_looks_m3u8 {
         let m3u8_text = match resp.text().await {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("Failed to read m3u8 content: {:?}", e);
+                eprintln!("Failed to read potential m3u8 content ({}): {:?}", target_url, e);
                 return HttpResponse::InternalServerError().body("Failed to read m3u8");
             }
         };
 
-        let scrape_url = Url::parse(&target_url).unwrap();
-        let headers_param = query.get("headers").cloned();
+        let looks_like_m3u8 = m3u8_text.trim_start().starts_with("#EXTM3U");
+        if ct_is_m3u8 || looks_like_m3u8 {
+            let scrape_url = Url::parse(&target_url).unwrap();
+            let headers_param = query.get("headers").cloned();
+            
+            // Process m3u8 sequentially
+            let lines = m3u8_text.lines();
+            let mut processed_lines = Vec::with_capacity(lines.size_hint().0);
+            
+            for line in lines {
+                processed_lines.push(process_m3u8_line(line, &scrape_url, &headers_param));
+            }
 
-        // Process m3u8 sequentially
-        let lines = m3u8_text.lines();
-        let mut processed_lines = Vec::with_capacity(lines.size_hint().0);
-        
-        for line in lines {
-            processed_lines.push(process_m3u8_line(line, &scrape_url, &headers_param));
+            return HttpResponse::Ok()
+                .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, acao.clone().unwrap_or("*".to_string())))
+                .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS, HEAD"))
+                .insert_header((header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Range, Origin, Accept, Accept-Encoding, Accept-Language, Cache-Control, Pragma, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform, Connection"))
+                .insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, Expires, Vary, ETag, Last-Modified"))
+                .insert_header((header::CROSS_ORIGIN_RESOURCE_POLICY, "cross-origin"))
+                .insert_header(("Vary", "Origin"))
+                .content_type("application/vnd.apple.mpegurl")
+                .insert_header((header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"))
+                .body(processed_lines.join("\n"));
+        } else {
+            let preview: String = m3u8_text.chars().take(200).collect();
+            eprintln!(
+                "Non-m3u8 body for URL ending with .m3u8 (status: {}, ct: {}): preview=\"{}\"",
+                status.as_u16(),
+                content_type,
+                preview.replace('\n', "\\n")
+            );
+
+            let mut response_builder = HttpResponse::build(status);
+            
+            // Set CORS headers for all responses - more permissive
+            response_builder.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, acao.clone().unwrap_or("*".to_string())));
+            response_builder.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS, HEAD"));
+            response_builder.insert_header((header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Range, Origin, Accept, Accept-Encoding, Accept-Language, Cache-Control, Pragma, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform, Connection"));
+            response_builder.insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, Expires, Vary, ETag, Last-Modified"));
+            response_builder.insert_header((header::CROSS_ORIGIN_RESOURCE_POLICY, "cross-origin"));
+            response_builder.insert_header(("Vary", "Origin"));
+            
+            // Copy important headers from the original response
+            for (name, value) in headers_copy.iter() {
+                let header_name = name.as_str().to_lowercase();
+                if header_name == "content-type" 
+                    || header_name == "content-length" 
+                    || header_name == "content-range"
+                    || header_name == "accept-ranges"
+                    || header_name == "cache-control"
+                    || header_name == "expires"
+                    || header_name == "last-modified"
+                    || header_name == "etag"
+                    || header_name == "content-encoding"
+                    || header_name == "vary" {
+                    response_builder.insert_header((name.clone(), value.clone()));
+                }
+            }
+
+            return response_builder.body(m3u8_text);
         }
-
-        return HttpResponse::Ok()
-            .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin))
-            .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS, HEAD"))
-            .insert_header((header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Range, Origin, Accept, Accept-Encoding, Accept-Language, Cache-Control, Pragma, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform, Connection"))
-            .insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, Expires, Vary, ETag, Last-Modified"))
-            .insert_header((header::CROSS_ORIGIN_RESOURCE_POLICY, "cross-origin"))
-            .content_type("application/vnd.apple.mpegurl")
-            .insert_header((header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"))
-            .body(processed_lines.join("\n"));
     }
 
     let mut response_builder = HttpResponse::build(status);
     
     // Set CORS headers for all responses - more permissive
-    response_builder.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone()));
+    response_builder.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, acao.clone().unwrap_or("*".to_string())));
     response_builder.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS, HEAD"));
     response_builder.insert_header((header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Range, Origin, Accept, Accept-Encoding, Accept-Language, Cache-Control, Pragma, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform, Connection"));
     response_builder.insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, Expires, Vary, ETag, Last-Modified"));
     response_builder.insert_header((header::CROSS_ORIGIN_RESOURCE_POLICY, "cross-origin"));
+    response_builder.insert_header(("Vary", "Origin"));
     
     // Copy important headers from the original response
     for (name, value) in headers_copy.iter() {
